@@ -23,7 +23,6 @@ from openai.types.chat import (
     ChatCompletionMessageParam,
     ChatCompletionMessageFunctionToolCall,
     ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCallUnionParam,
     ChatCompletionToolMessageParam,
     ChatCompletionToolParam,
 )
@@ -62,20 +61,6 @@ TOOLS: list[ChatCompletionToolParam] = [
     }
 ]
 
-BLOCKED_OPERATORS = {"|", "||", "&&", ";", "&"}
-BLOCKED_REDIRECTION_PREFIXES = (">", "<", "1>", "1>>", "2>", "2>>", ">&", "<&")
-BLOCKED_SHELLS = {
-    "bash",
-    "sh",
-    "zsh",
-    "dash",
-    "ksh",
-    "fish",
-    "cmd",
-    "cmd.exe",
-    "powershell",
-    "pwsh",
-}
 BLOCKED_SUBSTRINGS = ("rm -rf /", "sudo", "shutdown", "reboot", ":(){:|:&};:")
 
 
