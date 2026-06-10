@@ -31,9 +31,9 @@ load_dotenv(override=True)
 
 client = OpenAI(
     api_key=os.environ["DEEPSEEK_API_KEY"],
-    base_url="https://api.deepseek.com",
+    base_url=os.environ["BASE_URL"],
 )
-MODEL = os.environ.get("MODEL_ID", "deepseek-v4-flash")
+MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = (
     f"you are a helpful assistant and coding agent at {os.getcwd()}."
