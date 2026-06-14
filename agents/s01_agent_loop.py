@@ -30,7 +30,7 @@ from openai.types.chat import (
 load_dotenv(override=True)
 
 client = OpenAI(
-    api_key=os.environ["DEEPSEEK_API_KEY"],
+    api_key=os.environ["API_KEY"],
     base_url=os.environ["BASE_URL"],
 )
 MODEL = os.environ["MODEL_ID"]
