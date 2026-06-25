@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -25,9 +26,16 @@ client = OpenAI(
     base_url=os.environ["BASE_URL"],
 )
 MODEL = os.environ["MODEL_ID"]
-
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
-SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+CURRENT_TODOS: list[dict[str, Any]] = []
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "For complex sub-problems, use the task tool to spawn a subagent."
+)
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
+)
 
 
 def safe_path(path_str: str) -> Path:
@@ -41,7 +49,6 @@ def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
         return "Error: Dangerous command blocked"
-
     try:
         result = subprocess.run(
             command,
@@ -83,13 +90,77 @@ def run_write(path: str, content: str) -> str:
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         file_path = safe_path(path)
-        content = file_path.read_text()
-        if old_text not in content:
-            return f"Error: Text not found in {path}"
-        file_path.write_text(content.replace(old_text, new_text, 1))
+        text = file_path.read_text()
+        if old_text not in text:
+            return f"Error: text not found in {path}"
+        file_path.write_text(text.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as exc:
         return f"Error: {exc}"
+
+
+def run_glob(pattern: str) -> str:
+    import glob as g
+
+    try:
+        results: list[str] = []
+        for match in g.glob(pattern, root_dir=WORKDIR):
+            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
+                results.append(match)
+        return "\n".join(results) if results else "(no matches)"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def _normalize_todos(todos: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                todos = ast.literal_eval(todos)
+            except (SyntaxError, ValueError):
+                return None, "Error: todos must be a list or JSON array string"
+    if not isinstance(todos, list):
+        return None, "Error: todos must be a list"
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            return None, f"Error: todos[{i}] must be an object"
+        if "content" not in t or "status" not in t:
+            return None, f"Error: todos[{i}] missing 'content' or 'status'"
+        if t["status"] not in ("pending", "in_progress", "completed"):
+            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
+    return todos, None
+
+
+def run_todo_write(todos: list[Any]) -> str:
+    global CURRENT_TODOS
+    normalized_todos, error = _normalize_todos(todos)
+    if error:
+        return error
+
+    if normalized_todos is None:
+        return "Error: todos must be a list"
+    CURRENT_TODOS = normalized_todos
+    lines = ["\n\033[33m## Current Tasks\033[0m"]
+    for t in CURRENT_TODOS:
+        icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
+        lines.append(f"  [{icon}] {t['content']}")
+    print("\n".join(lines))
+    return f"Updated {len(CURRENT_TODOS)} tasks"
+
+
+def extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    texts: list[str] = []
+    for block in content:
+        text = getattr(block, "text", None)
+        if text:
+            texts.append(text)
+    return "\n".join(texts).strip()
 
 
 def _tool_call_arguments(call: ChatCompletionMessageFunctionToolCall) -> dict[str, Any]:
@@ -146,20 +217,6 @@ def _tool_result_message(
     )
 
 
-def extract_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, list):
-        return ""
-
-    texts: list[str] = []
-    for block in content:
-        text = getattr(block, "text", None)
-        if text:
-            texts.append(text)
-    return "\n".join(texts).strip()
-
-
 ToolHandler = Callable[..., str]
 
 TOOL_HANDLERS: dict[str, ToolHandler] = {
@@ -167,9 +224,11 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "glob": lambda **kw: run_glob(kw["pattern"]),
+    "todo_write": lambda **kw: run_todo_write(kw["todos"]),
 }
 
-CHILD_TOOLS: list[ChatCompletionToolParam] = [
+SUB_TOOLS: list[ChatCompletionToolParam] = [
     {
         "type": "function",
         "function": {
@@ -177,9 +236,7 @@ CHILD_TOOLS: list[ChatCompletionToolParam] = [
             "description": "Run a shell command.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                },
+                "properties": {"command": {"type": "string"}},
                 "required": ["command"],
                 "additionalProperties": False,
             },
@@ -193,10 +250,7 @@ CHILD_TOOLS: list[ChatCompletionToolParam] = [
             "description": "Read file contents.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "limit": {"type": "integer"},
-                },
+                "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
                 "required": ["path"],
                 "additionalProperties": False,
             },
@@ -224,7 +278,7 @@ CHILD_TOOLS: list[ChatCompletionToolParam] = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Replace exact text in a file.",
+            "description": "Replace exact text in a file once.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -238,24 +292,46 @@ CHILD_TOOLS: list[ChatCompletionToolParam] = [
             "strict": True,
         },
     },
-]
-
-PARENT_TOOLS: list[ChatCompletionToolParam] = CHILD_TOOLS + [
     {
         "type": "function",
         "function": {
-            "name": "task",
-            "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": "Create and manage a task list for your current coding session.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string"},
-                    "description": {
-                        "type": "string",
-                        "description": "Short description of the task",
-                    },
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                },
+                                "active_form": {"type": "string"},
+                            },
+                            "required": ["content", "status"],
+                            "additionalProperties": False,
+                        },
+                    }
                 },
-                "required": ["prompt"],
+                "required": ["todos"],
                 "additionalProperties": False,
             },
             "strict": True,
@@ -265,7 +341,7 @@ PARENT_TOOLS: list[ChatCompletionToolParam] = CHILD_TOOLS + [
 
 
 def run_subagent(prompt: str) -> str:
-    sub_messages: list[ChatCompletionMessageParam] = [
+    messages: list[ChatCompletionMessageParam] = [
         cast(
             ChatCompletionMessageParam,
             {
@@ -274,53 +350,13 @@ def run_subagent(prompt: str) -> str:
             },
         )
     ]
-
-    last_response_content: Any = None
+    last_summary = ""
 
     for _ in range(30):
         response = client.chat.completions.create(
             model=MODEL,
-            messages=sub_messages,
-            tools=CHILD_TOOLS,
-            max_tokens=8000,
-        )
-        message = response.choices[0].message
-        last_response_content = message.content
-
-        tool_calls = [
-            call
-            for call in (message.tool_calls or [])
-            if isinstance(call, ChatCompletionMessageFunctionToolCall)
-        ]
-
-        if tool_calls:
-            sub_messages.append(_assistant_tool_message(message.content, tool_calls))
-
-            for call in tool_calls:
-                handler = TOOL_HANDLERS.get(call.function.name)
-                try:
-                    args = _tool_call_arguments(call)
-                    output = handler(**args) if handler else f"Unknown tool: {call.function.name}"
-                except Exception as exc:
-                    output = f"Error: {exc}"
-                sub_messages.append(_tool_result_message(call, str(output)))
-            continue
-
-        content = extract_text(message.content)
-        if not content:
-            raise RuntimeError("Subagent returned an empty assistant message")
-        return content
-
-    summary = extract_text(last_response_content)
-    return summary or "(no summary)"
-
-
-def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
-    while True:
-        response = client.chat.completions.create(
-            model=MODEL,
             messages=messages,
-            tools=PARENT_TOOLS,
+            tools=SUB_TOOLS,
             max_tokens=8000,
         )
         message = response.choices[0].message
@@ -334,20 +370,72 @@ def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
             messages.append(_assistant_tool_message(message.content, tool_calls))
 
             for call in tool_calls:
+                handler = TOOL_HANDLERS.get(call.function.name)
+                try:
+                    args = _tool_call_arguments(call)
+                    output = handler(**args) if handler else f"Unknown: {call.function.name}"
+                except Exception as exc:
+                    output = f"Error: {exc}"
+                messages.append(_tool_result_message(call, str(output)))
+            continue
+
+        summary = extract_text(message.content)
+        if not summary:
+            raise RuntimeError("Subagent returned an empty assistant message")
+        last_summary = summary
+        return summary
+
+    return last_summary or "(no summary)"
+
+
+def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
+    while True:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=SUB_TOOLS + [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "task",
+                        "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string"},
+                            },
+                            "required": ["description"],
+                            "additionalProperties": False,
+                        },
+                        "strict": True,
+                    },
+                }
+            ],
+            max_tokens=8000,
+        )
+        message = response.choices[0].message
+        tool_calls = [
+            call
+            for call in (message.tool_calls or [])
+            if isinstance(call, ChatCompletionMessageFunctionToolCall)
+        ]
+
+        if tool_calls:
+            messages.append(_assistant_tool_message(message.content, tool_calls))
+
+            for call in tool_calls:
+                handler = TOOL_HANDLERS.get(call.function.name)
                 try:
                     args = _tool_call_arguments(call)
                     if call.function.name == "task":
-                        desc = str(args.get("description", "subtask"))
-                        prompt = str(args.get("prompt", ""))
-                        print(f"> task ({desc}): {prompt[:80]}")
-                        output = run_subagent(prompt)
+                        description = str(args.get("description", ""))
+                        output = run_subagent(description)
                     else:
-                        handler = TOOL_HANDLERS.get(call.function.name)
-                        output = handler(**args) if handler else f"Unknown tool: {call.function.name}"
+                        output = handler(**args) if handler else f"Unknown: {call.function.name}"
                 except Exception as exc:
                     output = f"Error: {exc}"
-
-                print(f"  {str(output)[:200]}")
+                print(f"> {call.function.name}:")
+                print(str(output)[:200])
                 messages.append(_tool_result_message(call, str(output)))
             continue
 
@@ -368,6 +456,8 @@ def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
 
 
 if __name__ == "__main__":
+    print("s06: Subagent - spawn sub-agents with fresh context, summary only")
+    print("Type a question, press Enter. Type q to quit.\n")
     history: list[ChatCompletionMessageParam] = [
         cast(
             ChatCompletionMessageParam,
@@ -380,13 +470,11 @@ if __name__ == "__main__":
 
     while True:
         try:
-            query = input("\033[36ms04 >> \033[0m")
+            query = input("\033[36ms06 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-
         if query.strip().lower() in ("q", "exit", ""):
             break
-
         history.append(
             cast(
                 ChatCompletionMessageParam,
@@ -397,9 +485,4 @@ if __name__ == "__main__":
             )
         )
         agent_loop(history)
-        last_message = history[-1]
-        if last_message.get("role") == "assistant":
-            content = last_message.get("content")
-            if isinstance(content, str) and content:
-                print(content)
         print()
