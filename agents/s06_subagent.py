@@ -341,6 +341,8 @@ SUB_TOOLS: list[ChatCompletionToolParam] = [
 
 
 def run_subagent(prompt: str) -> str:
+    print("[subagent] start")
+    print(f"[subagent] prompt: {prompt}")
     messages: list[ChatCompletionMessageParam] = [
         cast(
             ChatCompletionMessageParam,
@@ -367,6 +369,7 @@ def run_subagent(prompt: str) -> str:
         ]
 
         if tool_calls:
+            print(f"[subagent] tool_calls: {', '.join(call.function.name for call in tool_calls)}")
             messages.append(_assistant_tool_message(message.content, tool_calls))
 
             for call in tool_calls:
@@ -376,6 +379,7 @@ def run_subagent(prompt: str) -> str:
                     output = handler(**args) if handler else f"Unknown: {call.function.name}"
                 except Exception as exc:
                     output = f"Error: {exc}"
+                print(f"[subagent] tool: {call.function.name}")
                 messages.append(_tool_result_message(call, str(output)))
             continue
 
@@ -383,8 +387,12 @@ def run_subagent(prompt: str) -> str:
         if not summary:
             raise RuntimeError("Subagent returned an empty assistant message")
         last_summary = summary
+        print("[subagent] done")
+        print(f"[subagent] summary: {summary[:200]}")
         return summary
 
+    print("[subagent] done")
+    print(f"[subagent] summary: {last_summary[:200] or '(no summary)'}")
     return last_summary or "(no summary)"
 
 
@@ -429,7 +437,10 @@ def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
                     args = _tool_call_arguments(call)
                     if call.function.name == "task":
                         description = str(args.get("description", ""))
+                        print(f"> task: {description[:200]}")
+                        print("[outer] dispatching subagent")
                         output = run_subagent(description)
+                        print("[outer] subagent returned")
                     else:
                         output = handler(**args) if handler else f"Unknown: {call.function.name}"
                 except Exception as exc:
