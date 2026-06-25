@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import ast
 import json
 import os
 import subprocess
@@ -165,17 +168,60 @@ def run_write(path: str, content: str) -> str:
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
         file_path = safe_path(path)
-        content = file_path.read_text()
-        if old_text not in content:
-            return f"Error: Text not found in {path}"
-        file_path.write_text(content.replace(old_text, new_text, 1))
+        text = file_path.read_text()
+        if old_text not in text:
+            return f"Error: text not found in {path}"
+        file_path.write_text(text.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as exc:
         return f"Error: {exc}"
 
 
+def run_glob(pattern: str) -> str:
+    import glob as g
+
+    try:
+        results: list[str] = []
+        for match in g.glob(pattern, root_dir=WORKDIR):
+            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
+                results.append(match)
+        return "\n".join(results) if results else "(no matches)"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def _normalize_todos(todos: Any) -> tuple[list[dict[str, Any]] | None, str | None]:
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError:
+            try:
+                todos = ast.literal_eval(todos)
+            except (SyntaxError, ValueError):
+                return None, "Error: todos must be a list or JSON array string"
+    if not isinstance(todos, list):
+        return None, "Error: todos must be a list"
+    for i, t in enumerate(todos):
+        if not isinstance(t, dict):
+            return None, f"Error: todos[{i}] must be an object"
+        if "content" not in t or "status" not in t:
+            return None, f"Error: todos[{i}] missing 'content' or 'status'"
+        if t["status"] not in ("pending", "in_progress", "completed"):
+            return None, f"Error: todos[{i}] has invalid status '{t['status']}'"
+    return todos, None
+
+
+def run_todo_write(todos: Any) -> str:
+    normalized_todos, error = _normalize_todos(todos)
+    if error:
+        return error
+    if normalized_todos is None:
+        return "Error: todos must be a list"
+    return TODO.update(normalized_todos)
+
+
 def _tool_call_arguments(call: ChatCompletionMessageFunctionToolCall) -> dict[str, Any]:
-    raw = getattr(call.function, "arguments", None) or "{}"
+    raw = call.function.arguments or "{}"
     try:
         args = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -205,13 +251,13 @@ def _assistant_tool_message(
     content: str | None,
     tool_calls: list[ChatCompletionMessageFunctionToolCall],
 ) -> ChatCompletionAssistantMessageParam:
-    msg: dict[str, Any] = {
+    message: dict[str, Any] = {
         "role": "assistant",
         "tool_calls": [_tool_call_to_param(call) for call in tool_calls],
     }
     if content is not None:
-        msg["content"] = content
-    return cast(ChatCompletionAssistantMessageParam, msg)
+        message["content"] = content
+    return cast(ChatCompletionAssistantMessageParam, message)
 
 
 def _tool_result_message(
@@ -235,7 +281,8 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "todo": lambda **kw: TODO.update(kw["items"]),
+    "glob": lambda **kw: run_glob(kw["pattern"]),
+    "todo_write": lambda **kw: run_todo_write(kw["todos"]),
 }
 
 TOOLS: list[ChatCompletionToolParam] = [
@@ -308,12 +355,26 @@ TOOLS: list[ChatCompletionToolParam] = [
     {
         "type": "function",
         "function": {
-            "name": "todo",
-            "description": "Rewrite the current session plan for multi-step work.",
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": "Create and manage a task list for your current coding session.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "items": {
+                    "todos": {
                         "type": "array",
                         "items": {
                             "type": "object",
@@ -323,17 +384,14 @@ TOOLS: list[ChatCompletionToolParam] = [
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
                                 },
-                                "active_form": {
-                                    "type": "string",
-                                    "description": "Optional present-continuous label.",
-                                },
+                                "active_form": {"type": "string"},
                             },
                             "required": ["content", "status"],
                             "additionalProperties": False,
                         },
                     }
                 },
-                "required": ["items"],
+                "required": ["todos"],
                 "additionalProperties": False,
             },
             "strict": True,
@@ -342,7 +400,12 @@ TOOLS: list[ChatCompletionToolParam] = [
 ]
 
 
+PLAN_REMINDER_INTERVAL = 3
+
+
 def extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
     if not isinstance(content, list):
         return ""
     texts: list[str] = []
@@ -354,7 +417,20 @@ def extract_text(content: Any) -> str:
 
 
 def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
+    rounds_since_todo = 0
     while True:
+        if rounds_since_todo >= PLAN_REMINDER_INTERVAL and messages:
+            messages.append(
+                cast(
+                    ChatCompletionMessageParam,
+                    {
+                        "role": "user",
+                        "content": "<reminder>Update your todos.</reminder>",
+                    },
+                )
+            )
+            rounds_since_todo = 0
+
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -370,33 +446,24 @@ def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
 
         if tool_calls:
             messages.append(_assistant_tool_message(message.content, tool_calls))
-            used_todo = False
+            rounds_since_todo += 1
 
             for call in tool_calls:
                 handler = TOOL_HANDLERS.get(call.function.name)
                 try:
-                    output = handler(**_tool_call_arguments(call)) if handler else f"Unknown tool: {call.function.name}"
+                    args = _tool_call_arguments(call)
+                    output = handler(**args) if handler else f"Unknown: {call.function.name}"
                 except Exception as exc:
                     output = f"Error: {exc}"
-                print(f"> {call.function.name}: {str(output)[:200]}")
+                if call.function.name == "todo_write":
+                    rounds_since_todo = 0
+                print(f"> {call.function.name}:")
+                print(str(output)[:200])
                 messages.append(_tool_result_message(call, str(output)))
-                if call.function.name == "todo":
-                    used_todo = True
-
-            if not used_todo:
-                TODO.note_round_without_update()
-                reminder = TODO.reminder()
-                if reminder:
-                    messages.append(
-                        cast(
-                            ChatCompletionMessageParam,
-                            {"role": "assistant", "content": reminder},
-                        )
-                    )
             continue
 
-        content = message.content or ""
-        if not content.strip():
+        content = extract_text(message.content)
+        if not content:
             raise RuntimeError("Model returned an empty assistant message")
         messages.append(
             cast(
@@ -412,6 +479,8 @@ def agent_loop(messages: list[ChatCompletionMessageParam]) -> None:
 
 
 if __name__ == "__main__":
+    print("s05: TodoWrite - plan before execute, nag if you forget")
+    print("Type a question, press Enter. Type q to quit.\n")
     history: list[ChatCompletionMessageParam] = [
         cast(
             ChatCompletionMessageParam,
@@ -421,9 +490,10 @@ if __name__ == "__main__":
             },
         )
     ]
+
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            query = input("\033[36ms05 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -438,9 +508,4 @@ if __name__ == "__main__":
             )
         )
         agent_loop(history)
-        last_message = history[-1]
-        if last_message.get("role") == "assistant":
-            content = last_message.get("content")
-            if isinstance(content, str) and content:
-                print(content)
         print()
