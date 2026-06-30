@@ -1,0 +1,1 @@
+Cek agents/s01_agent_loop.py dan implementasikan preferensi permanen saya saat minta formatting kode: function dipisah 1 blank line, komentar section menempel ke fungsi bawahnya, jangan membabat komentar yang masih relevan, gunakan format yang nyaman dibaca mata
